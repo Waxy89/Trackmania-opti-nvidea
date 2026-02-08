@@ -38,6 +38,7 @@ $ErrorActionPreference = 'Stop'
 function OK($m){ Write-Host "OK - $m" -ForegroundColor Green }
 function WARN($m){ Write-Host $m -ForegroundColor DarkYellow }
 function FAIL($m){ Write-Host "FEL - $m" -ForegroundColor Red }
+$script:timerLocked = $false
 
 Write-Host "`n========== TRACKMANIA PERFORMANCE LAUNCHER (NVIDIA) ==========" -ForegroundColor Cyan
 
@@ -82,7 +83,7 @@ namespace TM {
 if (-not ([Type]::GetType('TM.Native'))) { Add-Type -TypeDefinition $code -Language CSharp -IgnoreWarnings | Out-Null }
 
 # Timer lock 0.5 ms
-[uint32]$cur=0; [void][TM.Native]::NtSetTimerResolution(5000,$true,[ref]$cur); OK "Timer låst (0.5 ms)"
+[uint32]$cur=0; [void][TM.Native]::NtSetTimerResolution(5000,$true,[ref]$cur); $script:timerLocked=$true; OK "Timer låst (0.5 ms)"
 
 # powercfg GUIDs
 $GUID_BALANCED_TEMPLATE='381b4222-f694-41f0-9685-ff5bb260df2e'
@@ -96,6 +97,7 @@ $USB_SUSPEND='3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e'; $DISK_IDLE='6738e2c4-e8a5-4
 function Unhide([string]$S,[string]$T){ try{ & powercfg -attributes $S $T -ATTRIB_HIDE 2>$null }catch{} }
 function Exists([string]$P,[string]$S,[string]$T){ try{ $null=& powercfg /q $P $S $T 2>$null; $true }catch{ $false } }
 function SetAC([string]$P,[string]$S,[string]$T,[int]$V,[string]$L){ Unhide $S $T; if(Exists $P $S $T){ $o=& powercfg -setacvalueindex $P $S $T $V 2>&1; if($LASTEXITCODE -eq 0){ OK "$L = $V" } else { FAIL "$L kunde inte sättas"; if($o){$o|%{"  $_"}} } } else { WARN "Saknas: $L" } }
+function RestoreVal($p,$n){$k="$p|$n"; if($regSnap["$k.Exists"]){ Set-ItemProperty -Path $p -Name $n -Type DWord -Value $regSnap["$k.Value"] } else { Remove-ItemProperty -Path $p -Name $n -ErrorAction SilentlyContinue } }
 
 # Hämta alla planer + aktiv plan
 function Plans{
@@ -118,154 +120,174 @@ OK ("Återställning -> {0} ({1})" -f $RestorePlan.Name,$RestorePlan.Guid)
 
 $UltimatePlan=$plans|?{$_.Name -match '(?i)ultimate'}|Select-Object -First 1
 
-# TEMP-plan
-$gameGuid=$null
-if($UltimatePlan){
-  $dup=& powercfg -duplicatescheme $UltimatePlan.Guid 2>&1
-  if($LASTEXITCODE -eq 0 -and ($dup -match 'Power Scheme GUID:\s*([0-9a-fA-F-]+)')){$gameGuid=$Matches[1].ToLower(); OK "TEMP från Ultimate"}
-}
-if(-not $gameGuid){
-  $dup=& powercfg -duplicatescheme $GUID_BALANCED_TEMPLATE 2>&1
-  if($LASTEXITCODE -eq 0 -and ($dup -match 'Power Scheme GUID:\s*([0-9a-fA-F-]+)')){$gameGuid=$Matches[1].ToLower(); OK "TEMP från Balanced-mall"}
-}
-if(-not $gameGuid){
-  $dup=& powercfg -duplicatescheme $GUID_HIGH_TEMPLATE 2>&1
-  if($LASTEXITCODE -eq 0 -and ($dup -match 'Power Scheme GUID:\s*([0-9a-fA-F-]+)')){$gameGuid=$Matches[1].ToLower(); OK "TEMP från High Performance-mall"}
-}
-if(-not $gameGuid){ throw "Kunde inte skapa TEMP-plan." }
-try{ & powercfg -changename $gameGuid "TM TEMP (Do Not Keep)" "Skapad $(Get-Date -Format s)" 2>$null }catch{}
-$null=& powercfg -setactive $gameGuid; OK "TEMP-plan aktiv: $gameGuid"
-
-# CPU/Device policys (TEMP)
-SetAC $gameGuid $SUB_PROCESSOR $PROC_EPP          $CPU_EPP         "EPP"
-SetAC $gameGuid $SUB_PROCESSOR $PROC_BOOST_MODE   $CPU_BoostMode   "Boost mode"
-SetAC $gameGuid $SUB_PROCESSOR $PROC_MIN_CORES    $CPU_MinCores    "Core parking min cores (%)"
-SetAC $gameGuid $SUB_PROCESSOR $PROC_IDLE_DISABLE $CPU_IdleDisable "Processor idle disable"
-SetAC $gameGuid $SUB_PROCESSOR $PROC_MIN_STATE    $CPU_MinState    "Minimum processor state (%)"
-SetAC $gameGuid $SUB_PROCESSOR $PROC_MAX_STATE    $CPU_MaxState    "Maximum processor state (%)"
-SetAC $gameGuid $SUB_DISK      $DISK_IDLE         0                "Disk idle timeout (AC)"
-SetAC $gameGuid $SUB_USB       $USB_SUSPEND       0                "USB selective suspend (AC)"
-
-# Registry perf snapshot + tweaks
-$mmKey="HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"
 $regSnap=[ordered]@{}
-function SnapVal($p,$n){$k="$p|$n";$regSnap["$k.Exists"]=$false;try{$v=(Get-ItemProperty -Path $p -Name $n -ErrorAction SilentlyContinue).$n;if($null -ne $v){$regSnap["$k.Exists"]=$true;$regSnap["$k.Value"]=[int]$v}}catch{}}
-SnapVal "HKCU:\Control Panel\Desktop" "ForegroundLockTimeout"
-SnapVal "HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl" "Win32PrioritySeparation"
-SnapVal $mmKey "NetworkThrottlingIndex"; SnapVal $mmKey "SystemResponsiveness"
-Set-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name "ForegroundLockTimeout" -Type DWord -Value 0
-Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl" -Name "Win32PrioritySeparation" -Type DWord -Value 26
-New-ItemProperty -Path $mmKey -Name "NetworkThrottlingIndex" -PropertyType DWord -Value 0xffffffff -Force | Out-Null
-Set-ItemProperty -Path $mmKey -Name "SystemResponsiveness" -Type DWord -Value 0
-OK "Registry tweaks tillämpade"
-
-# (VALBART) Game Bar/DVR/FSO - AV som standard
 $uiSnap=[ordered]@{}
-function SnapSet($p,$n,$v){$k="$p|$n";$uiSnap["$k.Exists"]=$false;try{$cv=(Get-ItemProperty -Path $p -Name $n -ErrorAction SilentlyContinue).$n;if($null -ne $cv){$uiSnap["$k.Exists"]=$true;$uiSnap["$k.Value"]=[int]$cv}}catch{};New-Item -Path $p -Force|Out-Null;New-ItemProperty -Path $p -Name $n -PropertyType DWord -Value $v -Force|Out-Null}
-if($DisableGameBarDvr){
-  SnapSet "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\GameDVR" "AppCaptureEnabled" 0
-  SnapSet "HKCU:\System\GameConfigStore" "GameDVR_Enabled" 0
-  SnapSet "HKCU:\System\GameConfigStore" "GameDVR_FSEBehavior" 2
-  SnapSet "HKCU:\System\GameConfigStore" "GameDVR_FSEBehaviorMode" 2
-  SnapSet "HKCU:\SOFTWARE\Microsoft\GameBar" "ShowStartupPanel" 0
-  SnapSet "HKCU:\SOFTWARE\Microsoft\GameBar" "AutoGameModeEnabled" 1
-  OK "Game Bar/DVR/FSO OFF (global)"
-}else{
-  Write-Host "Game Bar/DVR lämnas orörda (DisableGameBarDvr=false)." -ForegroundColor DarkGray
-}
+$NicSnap=@{}
+$script:nic=$null
+$script:gameGuid=$null
 
-# (VALFRITT) NVIDIA Profile Inspector
-if($NPI_Exe -and $NPI_Profile -and (Test-Path $NPI_Exe) -and (Test-Path $NPI_Profile)){
-  Write-Host "Importerar NPI-profil." -ForegroundColor Yellow
-  $npo = & $NPI_Exe -importProfile $NPI_Profile 2>&1
-  if($LASTEXITCODE -eq 0){ OK "NPI-profil importerad" } else { WARN "NPI: $($npo -join ' ')" }
-}
-
-# TCP tweaks
-function Get-TcpGlobal { (& netsh int tcp show global 2>&1) -join "`n" }
-$tcpBefore = Get-TcpGlobal
-& netsh int tcp set global autotuninglevel=normal | Out-Null
-& netsh int tcp set global rss=enabled          | Out-Null
-try{ & netsh int tcp set global dca=enabled   | Out-Null }catch{}
-try{ & netsh int tcp set global netdma=enabled| Out-Null }catch{}
-OK "TCP tweaks klara"
-
-# NIC tweaks
-$NicSnap=@{}; $nic=$null
-function Set-IfExists([string]$NicName,[string]$Disp,[string]$Val){
-  $prop=Get-NetAdapterAdvancedProperty -Name $NicName -ErrorAction SilentlyContinue|?{$_.DisplayName -eq $Disp}
-  if($prop){
-    $script:NicSnap[$Disp]=$prop.DisplayValue
-    try{Set-NetAdapterAdvancedProperty -Name $NicName -DisplayName $Disp -DisplayValue $Val -NoRestart -ErrorAction Stop; OK "$Disp -> $Val"}catch{Write-Host "Hoppar över ($Disp): $($_.Exception.Message)" -ForegroundColor Yellow}
+function Restore-Session {
+  if($script:timerLocked){
+    try{ [void][TM.Native]::NtSetTimerResolution(5000,$false,[ref]$cur); OK "Timer släppt" }catch{ WARN "Timer kunde inte släppas: $($_.Exception.Message)" }
   }
-}
-if($DoSessionNicTweaks){
-  $nic=Get-NetAdapter|?{$_.Status -eq 'Up'}|Select-Object -First 1
-  if($nic){
-    Set-IfExists $nic.Name "Interrupt Moderation" "Disabled"
-    Set-IfExists $nic.Name "Energy Efficient Ethernet" "Disabled"
-    Set-IfExists $nic.Name "Green Ethernet" "Disabled"
-    Set-IfExists $nic.Name "System Idle Power Saver" "Disabled"
-    Set-IfExists $nic.Name "Ultra Low Power Mode" "Disabled"
-    Set-IfExists $nic.Name "Power Saving Mode" "Disabled"
-    Set-IfExists $nic.Name "Reduce link speed during system idle" "Disabled"
-    try{ Set-NetAdapterRss -Name $nic.Name -Enabled $true -ErrorAction Stop; $NicSnap["__RSS__"]="Enabled"; OK "RSS -> Enabled"}catch{Write-Host "Hoppar över RSS: $($_.Exception.Message)" -ForegroundColor Yellow}
-  }
-}
-
-# Starta Trackmania
-Start-Process $TrackmaniaUri
-while(-not (Get-Process -Name "trackmania*" -ErrorAction SilentlyContinue)){ Start-Sleep -Milliseconds 400 }
-$tm=Get-Process -Name "trackmania*" -ErrorAction SilentlyContinue|Select-Object -First 1
-if($tm){
-  try{ $tm.PriorityClass='High'; OK "Processprioritet = High" }catch{}
-  try{
-    $tm.Refresh(); $exePath=$tm.MainModule.FileName
-    if($exePath){
-      $appCompat="HKCU:\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"
-      New-Item -Path $appCompat -Force|Out-Null
-      $flags="~ DISABLEDXMAXIMIZEDWINDOWEDMODE ~ HIGHDPIAWARE"
-      New-ItemProperty -Path $appCompat -Name $exePath -PropertyType String -Value $flags -Force|Out-Null
-      OK "Per-exe: FSO OFF + High DPI Aware satt ($exePath) - gäller nästa start"
-    }
-  }catch{ WARN "Kunde inte sätta per-exe FSO/DPI: $($_.Exception.Message)" }
-  if($SetProcessAffinity){
+  if($DoSessionNicTweaks -and $script:nic){
     try{
-      $mask=[TM.Native]::GetPCoreMaskGroup0()
-      if($PreferAutoPCores -and $mask -ne 0){ $tm.ProcessorAffinity=[intptr]::new([long]$mask); OK ("Affinitet -> P-cores (0x{0:X})" -f $mask) }
-      else{ [long]$m=0; $n=[Environment]::ProcessorCount; for($i=0;$i -lt $n;$i+=2){ $m=$m -bor (1 -shl $i) }; if($m -ne 0){ $tm.ProcessorAffinity=[intptr]::new($m); OK ("Affinitet -> varannan tråd (0x{0:X})" -f $m) } }
-    }catch{ WARN "Affinitet misslyckades: $($_.Exception.Message)" }
+      foreach($k in $NicSnap.Keys){
+        if($k -eq "__RSS__"){
+          try{ Set-NetAdapterRss -Name $script:nic.Name -Enabled ($NicSnap[$k] -eq 'Enabled') -ErrorAction Stop }catch{}
+          continue
+        }
+        try{ Set-NetAdapterAdvancedProperty -Name $script:nic.Name -DisplayName $k -DisplayValue $NicSnap[$k] -NoRestart -ErrorAction Stop }catch{}
+      }
+      OK "NIC-egenskaper återställda"
+    }catch{ WARN "NIC-återställning misslyckades: $($_.Exception.Message)" }
+  }
+  if($regSnap.Count -gt 0){
+    try{
+      RestoreVal "HKCU:\Control Panel\Desktop" "ForegroundLockTimeout"
+      RestoreVal "HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl" "Win32PrioritySeparation"
+      RestoreVal $mmKey "NetworkThrottlingIndex"; RestoreVal $mmKey "SystemResponsiveness"
+    }catch{ WARN "Registry-återställning misslyckades: $($_.Exception.Message)" }
+  }
+  if($DisableGameBarDvr -and $uiSnap.Count -gt 0){
+    try{
+      foreach($kv in $uiSnap.Keys | ?{$_ -like "*|*" -and $_ -like "*.Exists"}){
+        $base=$kv -replace '\.Exists$',''; $parts=$base.Split('|',2); $p=$parts[0]; $n=$parts[1]
+        if($uiSnap[$kv]){ Set-ItemProperty -Path $p -Name $n -Type DWord -Value $uiSnap["$base.Value"] } else { Remove-ItemProperty -Path $p -Name $n -ErrorAction SilentlyContinue }
+      }
+      OK "Game Bar/DVR/FSO (global) återställda"
+    }catch{ WARN "Game Bar/DVR-återställning misslyckades: $($_.Exception.Message)" }
+  }
+  if($RestorePlan){
+    try{ $null=& powercfg -setactive $RestorePlan.Guid; OK ("Återställd plan aktiv: {0}" -f $RestorePlan.Guid) }catch{ WARN "Kunde inte återställa strömplan: $($_.Exception.Message)" }
+  }
+  if($script:gameGuid){
+    try{ & powercfg -delete $script:gameGuid 2>$null; OK "TEMP-plan borttagen" }catch{ WARN "Kunde inte ta bort TEMP-plan: $($_.Exception.Message)" }
   }
 }
-while(Get-Process -Name "trackmania*" -ErrorAction SilentlyContinue){ Start-Sleep -Seconds 5 }
 
-# Återställning
-[void][TM.Native]::NtSetTimerResolution(5000,$false,[ref]$cur); OK "Timer släppt"
+# TEMP-plan
+$script:gameGuid=$null
+try{
+  if($UltimatePlan){
+    $dup=& powercfg -duplicatescheme $UltimatePlan.Guid 2>&1
+    if($LASTEXITCODE -eq 0 -and ($dup -match 'Power Scheme GUID:\s*([0-9a-fA-F-]+)')){$script:gameGuid=$Matches[1].ToLower(); OK "TEMP från Ultimate"}
+  }
+  if(-not $script:gameGuid){
+    $dup=& powercfg -duplicatescheme $GUID_BALANCED_TEMPLATE 2>&1
+    if($LASTEXITCODE -eq 0 -and ($dup -match 'Power Scheme GUID:\s*([0-9a-fA-F-]+)')){$script:gameGuid=$Matches[1].ToLower(); OK "TEMP från Balanced-mall"}
+  }
+  if(-not $script:gameGuid){
+    $dup=& powercfg -duplicatescheme $GUID_HIGH_TEMPLATE 2>&1
+    if($LASTEXITCODE -eq 0 -and ($dup -match 'Power Scheme GUID:\s*([0-9a-fA-F-]+)')){$script:gameGuid=$Matches[1].ToLower(); OK "TEMP från High Performance-mall"}
+  }
+  if(-not $script:gameGuid){ throw "Kunde inte skapa TEMP-plan." }
+  try{ & powercfg -changename $script:gameGuid "TM TEMP (Do Not Keep)" "Skapad $(Get-Date -Format s)" 2>$null }catch{}
+  $null=& powercfg -setactive $script:gameGuid; OK "TEMP-plan aktiv: $script:gameGuid"
 
-if($DoSessionNicTweaks -and $nic){
-  foreach($k in $NicSnap.Keys){
-    if($k -eq "__RSS__"){
-      try{ Set-NetAdapterRss -Name $nic.Name -Enabled ($NicSnap[$k] -eq 'Enabled') -ErrorAction Stop }catch{}
-      continue
+  # CPU/Device policys (TEMP)
+  SetAC $script:gameGuid $SUB_PROCESSOR $PROC_EPP          $CPU_EPP         "EPP"
+  SetAC $script:gameGuid $SUB_PROCESSOR $PROC_BOOST_MODE   $CPU_BoostMode   "Boost mode"
+  SetAC $script:gameGuid $SUB_PROCESSOR $PROC_MIN_CORES    $CPU_MinCores    "Core parking min cores (%)"
+  SetAC $script:gameGuid $SUB_PROCESSOR $PROC_IDLE_DISABLE $CPU_IdleDisable "Processor idle disable"
+  SetAC $script:gameGuid $SUB_PROCESSOR $PROC_MIN_STATE    $CPU_MinState    "Minimum processor state (%)"
+  SetAC $script:gameGuid $SUB_PROCESSOR $PROC_MAX_STATE    $CPU_MaxState    "Maximum processor state (%)"
+  SetAC $script:gameGuid $SUB_DISK      $DISK_IDLE         0                "Disk idle timeout (AC)"
+  SetAC $script:gameGuid $SUB_USB       $USB_SUSPEND       0                "USB selective suspend (AC)"
+
+  # Registry perf snapshot + tweaks
+  $mmKey="HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"
+  $regSnap=[ordered]@{}
+  function SnapVal($p,$n){$k="$p|$n";$regSnap["$k.Exists"]=$false;try{$v=(Get-ItemProperty -Path $p -Name $n -ErrorAction SilentlyContinue).$n;if($null -ne $v){$regSnap["$k.Exists"]=$true;$regSnap["$k.Value"]=[int]$v}}catch{}}
+  SnapVal "HKCU:\Control Panel\Desktop" "ForegroundLockTimeout"
+  SnapVal "HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl" "Win32PrioritySeparation"
+  SnapVal $mmKey "NetworkThrottlingIndex"; SnapVal $mmKey "SystemResponsiveness"
+  Set-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name "ForegroundLockTimeout" -Type DWord -Value 0
+  Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl" -Name "Win32PrioritySeparation" -Type DWord -Value 26
+  New-ItemProperty -Path $mmKey -Name "NetworkThrottlingIndex" -PropertyType DWord -Value 0xffffffff -Force | Out-Null
+  Set-ItemProperty -Path $mmKey -Name "SystemResponsiveness" -Type DWord -Value 0
+  OK "Registry tweaks tillämpade"
+
+  # (VALBART) Game Bar/DVR/FSO - AV som standard
+  $uiSnap=[ordered]@{}
+  function SnapSet($p,$n,$v){$k="$p|$n";$uiSnap["$k.Exists"]=$false;try{$cv=(Get-ItemProperty -Path $p -Name $n -ErrorAction SilentlyContinue).$n;if($null -ne $cv){$uiSnap["$k.Exists"]=$true;$uiSnap["$k.Value"]=[int]$cv}}catch{};New-Item -Path $p -Force|Out-Null;New-ItemProperty -Path $p -Name $n -PropertyType DWord -Value $v -Force|Out-Null}
+  if($DisableGameBarDvr){
+    SnapSet "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\GameDVR" "AppCaptureEnabled" 0
+    SnapSet "HKCU:\System\GameConfigStore" "GameDVR_Enabled" 0
+    SnapSet "HKCU:\System\GameConfigStore" "GameDVR_FSEBehavior" 2
+    SnapSet "HKCU:\System\GameConfigStore" "GameDVR_FSEBehaviorMode" 2
+    SnapSet "HKCU:\SOFTWARE\Microsoft\GameBar" "ShowStartupPanel" 0
+    SnapSet "HKCU:\SOFTWARE\Microsoft\GameBar" "AutoGameModeEnabled" 1
+    OK "Game Bar/DVR/FSO OFF (global)"
+  }else{
+    Write-Host "Game Bar/DVR lämnas orörda (DisableGameBarDvr=false)." -ForegroundColor DarkGray
+  }
+
+  # (VALFRITT) NVIDIA Profile Inspector
+  if($NPI_Exe -and $NPI_Profile -and (Test-Path $NPI_Exe) -and (Test-Path $NPI_Profile)){
+    Write-Host "Importerar NPI-profil." -ForegroundColor Yellow
+    $npo = & $NPI_Exe -importProfile $NPI_Profile 2>&1
+    if($LASTEXITCODE -eq 0){ OK "NPI-profil importerad" } else { WARN "NPI: $($npo -join ' ')" }
+  }
+
+  # TCP tweaks
+  function Get-TcpGlobal { (& netsh int tcp show global 2>&1) -join "`n" }
+  $tcpBefore = Get-TcpGlobal
+  & netsh int tcp set global autotuninglevel=normal | Out-Null
+  & netsh int tcp set global rss=enabled          | Out-Null
+  try{ & netsh int tcp set global dca=enabled   | Out-Null }catch{}
+  try{ & netsh int tcp set global netdma=enabled| Out-Null }catch{}
+  OK "TCP tweaks klara"
+
+  # NIC tweaks
+  $NicSnap=@{}; $script:nic=$null
+  function Set-IfExists([string]$NicName,[string]$Disp,[string]$Val){
+    $prop=Get-NetAdapterAdvancedProperty -Name $NicName -ErrorAction SilentlyContinue|?{$_.DisplayName -eq $Disp}
+    if($prop){
+      $script:NicSnap[$Disp]=$prop.DisplayValue
+      try{Set-NetAdapterAdvancedProperty -Name $NicName -DisplayName $Disp -DisplayValue $Val -NoRestart -ErrorAction Stop; OK "$Disp -> $Val"}catch{Write-Host "Hoppar över ($Disp): $($_.Exception.Message)" -ForegroundColor Yellow}
     }
-    try{ Set-NetAdapterAdvancedProperty -Name $nic.Name -DisplayName $k -DisplayValue $NicSnap[$k] -NoRestart -ErrorAction Stop }catch{}
   }
-  OK "NIC-egenskaper återställda"
-}
-
-function RestoreVal($p,$n){$k="$p|$n"; if($regSnap["$k.Exists"]){ Set-ItemProperty -Path $p -Name $n -Type DWord -Value $regSnap["$k.Value"] } else { Remove-ItemProperty -Path $p -Name $n -ErrorAction SilentlyContinue } }
-RestoreVal "HKCU:\Control Panel\Desktop" "ForegroundLockTimeout"
-RestoreVal "HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl" "Win32PrioritySeparation"
-RestoreVal $mmKey "NetworkThrottlingIndex"; RestoreVal $mmKey "SystemResponsiveness"
-
-if($DisableGameBarDvr){
-  foreach($kv in $uiSnap.Keys | ?{$_ -like "*|*" -and $_ -like "*.Exists"}){
-    $base=$kv -replace '\.Exists$',''; $parts=$base.Split('|',2); $p=$parts[0]; $n=$parts[1]
-    if($uiSnap[$kv]){ Set-ItemProperty -Path $p -Name $n -Type DWord -Value $uiSnap["$base.Value"] } else { Remove-ItemProperty -Path $p -Name $n -ErrorAction SilentlyContinue }
+  if($DoSessionNicTweaks){
+    $script:nic=Get-NetAdapter|?{$_.Status -eq 'Up'}|Select-Object -First 1
+    if($script:nic){
+      Set-IfExists $script:nic.Name "Interrupt Moderation" "Disabled"
+      Set-IfExists $script:nic.Name "Energy Efficient Ethernet" "Disabled"
+      Set-IfExists $script:nic.Name "Green Ethernet" "Disabled"
+      Set-IfExists $script:nic.Name "System Idle Power Saver" "Disabled"
+      Set-IfExists $script:nic.Name "Ultra Low Power Mode" "Disabled"
+      Set-IfExists $script:nic.Name "Power Saving Mode" "Disabled"
+      Set-IfExists $script:nic.Name "Reduce link speed during system idle" "Disabled"
+      try{ Set-NetAdapterRss -Name $script:nic.Name -Enabled $true -ErrorAction Stop; $NicSnap["__RSS__"]="Enabled"; OK "RSS -> Enabled"}catch{Write-Host "Hoppar över RSS: $($_.Exception.Message)" -ForegroundColor Yellow}
+    }
   }
-  OK "Game Bar/DVR/FSO (global) återställda"
-}
 
-$null=& powercfg -setactive $RestorePlan.Guid; OK ("Återställd plan aktiv: {0}" -f $RestorePlan.Guid)
-try{ & powercfg -delete $gameGuid 2>$null; OK "TEMP-plan borttagen" }catch{}
-Write-Host "`n? KLART - Sessionen stängd, allt återställt." -ForegroundColor Cyan
+  # Starta Trackmania
+  Start-Process $TrackmaniaUri
+  while(-not (Get-Process -Name "trackmania*" -ErrorAction SilentlyContinue)){ Start-Sleep -Milliseconds 400 }
+  $tm=Get-Process -Name "trackmania*" -ErrorAction SilentlyContinue|Select-Object -First 1
+  if($tm){
+    try{ $tm.PriorityClass='High'; OK "Processprioritet = High" }catch{}
+    try{
+      $tm.Refresh(); $exePath=$tm.MainModule.FileName
+      if($exePath){
+        $appCompat="HKCU:\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"
+        New-Item -Path $appCompat -Force|Out-Null
+        $flags="~ DISABLEDXMAXIMIZEDWINDOWEDMODE ~ HIGHDPIAWARE"
+        New-ItemProperty -Path $appCompat -Name $exePath -PropertyType String -Value $flags -Force|Out-Null
+        OK "Per-exe: FSO OFF + High DPI Aware satt ($exePath) - gäller nästa start"
+      }
+    }catch{ WARN "Kunde inte sätta per-exe FSO/DPI: $($_.Exception.Message)" }
+    if($SetProcessAffinity){
+      try{
+        $mask=[TM.Native]::GetPCoreMaskGroup0()
+        if($PreferAutoPCores -and $mask -ne 0){ $tm.ProcessorAffinity=[intptr]::new([long]$mask); OK ("Affinitet -> P-cores (0x{0:X})" -f $mask) }
+        else{ [long]$m=0; $n=[Environment]::ProcessorCount; for($i=0;$i -lt $n;$i+=2){ $m=$m -bor (1 -shl $i) }; if($m -ne 0){ $tm.ProcessorAffinity=[intptr]::new($m); OK ("Affinitet -> varannan tråd (0x{0:X})" -f $m) } }
+      }catch{ WARN "Affinitet misslyckades: $($_.Exception.Message)" }
+    }
+  }
+  while(Get-Process -Name "trackmania*" -ErrorAction SilentlyContinue){ Start-Sleep -Seconds 5 }
+}finally{
+  Restore-Session
+  Write-Host "`n? KLART - Sessionen stängd, allt återställt." -ForegroundColor Cyan
+}
